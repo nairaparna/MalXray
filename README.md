@@ -2,9 +2,8 @@
 
 **Project Title:** Next-Generation Malware Detection: Fusion of Static and Dynamic Analysis for Family Classification
 
-**Student:** Aparna Pradeep Nair  
+**Student:** Aparna Pradeep Nair & Rahul Amresh Jha
 **Guide:** Dr. Anupama Jawale  
-**University:** University of Mumbai – Department of Information Technology
 
 ## About the Project
 MalXray is a hybrid malware detection and family classification system that combines:
