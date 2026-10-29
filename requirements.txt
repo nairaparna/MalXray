@@ -1,0 +1,12 @@
+pefile
+psutil
+pyzipper
+python-magic-bin
+xgboost
+scikit-learn
+joblib
+pandas
+numpy
+reportlab
+requests
+matplotlib
