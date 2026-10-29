@@ -1,0 +1,1516 @@
+"""
+MalXray.py — MSc build
+Hybrid static + dynamic malware detection & family classification.
+
+  python MalXray.py            -> launch the desktop app
+  python MalXray.py --cli      -> launch the command-line shell
+  python MalXray.py --build    -> BUILD the installable software
+                                  (trains models if missing, packages the app,
+                                   and creates installer/MalXray_Setup.exe on Windows)
+"""
+
+import json
+import os
+import sys
+
+# ---------------------------------------------------------------------------
+# Locations (must be resolved BEFORE the analysis modules are imported, because
+# they open "pipeline.log" and read models relative to these paths).
+#   * Running from source : everything lives next to this file.
+#   * Installed (frozen)  : read-only resources live in the install folder,
+#                           user data (reports, logs, settings) in ~/MalXray.
+# ---------------------------------------------------------------------------
+FROZEN = bool(getattr(sys, "frozen", False))
+if sys.stdout is None:  # windowed build has no console
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__)) if not FROZEN else None
+RES_DIR = getattr(sys, "_MEIPASS", None) or SOURCE_DIR
+APP_HOME = (
+    os.path.join(os.path.expanduser("~"), "MalXray") if FROZEN else SOURCE_DIR
+)
+os.makedirs(APP_HOME, exist_ok=True)
+os.chdir(APP_HOME)
+os.environ.setdefault("MALXRAY_MODEL_DIR", os.path.join(RES_DIR, "models"))
+
+CONFIG_PATH = os.path.join(APP_HOME, "config.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+_cfg = load_config()
+if _cfg.get("vt_api_key") and not os.environ.get("VIRUSTOTAL_API_KEY"):
+    os.environ["VIRUSTOTAL_API_KEY"] = _cfg["vt_api_key"]
+
+import cmd
+import logging
+import queue
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+try:  # optional: real drag-and-drop
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+
+    _TkBase = TkinterDnD.Tk
+    HAS_DND = True
+except Exception:  # pragma: no cover
+    _TkBase = tk.Tk
+    HAS_DND = False
+
+import behavior_monitor
+import feature_fusion
+import ml_classifier
+import report_generator
+import virustotal_check
+from file_info import extract_file_info
+
+# ---------------------------------------------------------------------------
+# Logging & constants
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    filename="pipeline.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+APP_NAME = "MalXray"
+APP_VERSION = "2.0"
+MAX_ANALYSIS_BYTES = 200 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 10
+DETONATION_SECONDS = 20
+VT_ESCALATION_THRESHOLD = 3
+VALID_FLAGS = {"--detonate", "--upload-vt"}
+ARCHIVE_MIMES = {
+    "application/zip",
+    "application/x-rar",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+}
+ARCHIVE_EXTS = (".zip", ".rar", ".7z")
+VERDICT_ICONS = {
+    "Malicious": "🚨",
+    "Potentially Harmful": "⚠️",
+    "Benign": "✅",
+    "Unknown": "❓",
+}
+
+# Colour palette
+COLORS = {
+    "bg": "#0b1020",
+    "surface": "#131a2e",
+    "surface2": "#1b2440",
+    "border": "#2a3558",
+    "text": "#e8ecf8",
+    "muted": "#8a95b8",
+    "accent": "#22d3ee",
+    "accent2": "#7c5cff",
+    "success": "#34d399",
+    "warning": "#fbbf24",
+    "danger": "#f87171",
+    "header": "#7c5cff",
+}
+
+
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:120]
+
+
+# ---------------------------------------------------------------------------
+# Core CLI / pipeline engine
+# ---------------------------------------------------------------------------
+class MalXrayCLI(cmd.Cmd):
+    prompt = "⚡ MalXray> "
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.intro = self._build_intro()
+        self.confirmation_callback = None  # Desktop supplies a GUI confirm
+        self.results = []  # structured results for the GUI verdict card
+
+    # ------------------------------------------------------------------ status
+    @staticmethod
+    def _status_lines():
+        has_static = os.path.exists(ml_classifier.PATHS.get("binary_static", ""))
+        has_fused = os.path.exists(ml_classifier.PATHS.get("binary_fused", ""))
+        if has_static and has_fused:
+            ml = "ready (fused + static-only)"
+        elif has_static or has_fused:
+            ml = "partial (one model missing — run train_model.py)"
+        else:
+            ml = "NOT TRAINED (run generate_training_data.py → train_model.py)"
+        vt = "key set" if getattr(virustotal_check, "API_KEY", None) else "no key (set VIRUSTOTAL_API_KEY)"
+        vm = (
+            "enabled"
+            if os.environ.get("MALXRAY_ISOLATED_VM") == "1"
+            else "disabled (required only for --detonate)"
+        )
+        return [
+            f"ML models      : {ml}",
+            f"VirusTotal     : {vt}",
+            f"Detonation     : {vm}",
+        ]
+
+    def _build_intro(self):
+        status = "\n    ".join(self._status_lines())
+        return f"""
+    ╔══════════════════════════════════════════════════╗
+      🔥  MalXray — Hybrid Malware Scanner (MSc)  🔥
+    ╚══════════════════════════════════════════════════╝
+
+    {status}
+
+    Commands:
+      analyze <path> [--detonate] [--upload-vt]
+      history | status | clear | exit
+    """
+
+    # ---------------------------------------------------------------- pipeline
+    def locate_file(self, file_name):
+        print("🔄  Step 0 · Locating file…")
+        expanded = os.path.abspath(os.path.expanduser(os.path.normpath(file_name)))
+        found = expanded if os.path.isfile(expanded) else None
+
+        if not found:
+            target = os.path.basename(file_name)
+            for root, _, files in os.walk(os.getcwd()):
+                if target in files:
+                    found = os.path.join(root, target)
+                    break
+
+        if not found:
+            print(f"[✖] File not found: {file_name}")
+            logging.error(f"File not found: {file_name}")
+            return None
+
+        if os.name == "nt" and len(found) > 240 and not found.startswith("\\\\?\\"):
+            found = "\\\\?\\" + found
+        print(f"✅  Found: {found}")
+        return found
+
+    def run_pipeline(self, file_path, detonate=False, upload_vt=False):
+        self.results = []
+        try:
+            located = self.locate_file(file_path)
+            if not located:
+                return
+            if os.path.getsize(located) > MAX_ANALYSIS_BYTES:
+                print(
+                    f"[✖] File exceeds {MAX_ANALYSIS_BYTES // (1024 * 1024)} MB limit."
+                )
+                return
+
+            work_dir = tempfile.mkdtemp(prefix="malxray_")
+            try:
+                print("🔄  Step 1 · Reading file & computing hashes…")
+                file_data, file_info = extract_file_info(located, output_dir=work_dir)
+                if file_data is None:
+                    print("[✖] Could not read file.")
+                    return
+
+                container = os.path.basename(located)
+                members = self._archive_members(file_info)
+
+                if members:
+                    print(
+                        f"📦  Archive detected — analysing "
+                        f"{min(len(members), MAX_ARCHIVE_MEMBERS)} of {len(members)} members"
+                    )
+                    for name, info in members[:MAX_ARCHIVE_MEMBERS]:
+                        print(f"\n── {container} → {name} ──")
+                        with open(info["File Path"], "rb") as f:
+                            data = f.read()
+                        self._analyze_one(
+                            f"{container}__{name}",
+                            info["File Path"],
+                            data,
+                            info,
+                            detonate,
+                            upload_vt,
+                        )
+                else:
+                    if self._is_archive(file_info, located):
+                        print(
+                            "⚠️  Looks like an archive that could not be extracted "
+                            "(password / unsupported). Verdict applies only to the container."
+                        )
+                    self._analyze_one(
+                        container, located, file_data, file_info, detonate, upload_vt
+                    )
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+        except Exception as e:
+            logging.exception("Pipeline failed")
+            print(f"[✖] Pipeline failed: {e}")
+
+    @staticmethod
+    def _archive_members(file_info):
+        extracted = file_info.get("Extracted Contents") or {}
+        return [
+            (name, info)
+            for name, info in extracted.items()
+            if "Error" not in info and "File Path" in info
+        ]
+
+    @staticmethod
+    def _is_archive(file_info, path):
+        return (
+            file_info.get("File Type") in ARCHIVE_MIMES
+            or path.lower().endswith(ARCHIVE_EXTS)
+        )
+
+    def _analyze_one(self, label, path, data, info, detonate, upload_vt):
+        behavior_data = None
+        if detonate:
+            behavior_data = self._detonate(path)
+        else:
+            print(
+                "🔄  Step 2 · Runtime analysis skipped (static only). "
+                "Use --detonate inside an isolated VM to enable it."
+            )
+
+        print("🔄  Step 3 · Fusing static + dynamic features…")
+        fused = feature_fusion.fuse_features(
+            path, file_data=data, behavior_data=behavior_data
+        )
+
+        print("🔄  Step 4 · ML classification (XGBoost)…")
+        ml_result = ml_classifier.classify(fused)
+
+        print("🔄  Step 5 · VirusTotal cross-check…")
+        vt_results = self.virustotal_analysis(
+            info.get("SHA-256"), path, upload_vt
+        )
+
+        verdict, message = self.risk_assessment(ml_result, vt_results)
+        self.generate_final_report(
+            label, info, behavior_data, ml_result, vt_results, verdict, message
+        )
+
+    # -------------------------------------------------------- detonation
+    def _detonate(self, sample_path):
+        print("🔄  Step 2 · Runtime analysis (DETONATION)…")
+        if os.environ.get("MALXRAY_ISOLATED_VM") != "1":
+            print(
+                "[✖] Refusing to execute. Set MALXRAY_ISOLATED_VM=1 inside a "
+                "disposable, network-isolated VM first."
+            )
+            return None
+
+        warning = (
+            "You are about to EXECUTE this file on this machine.\n\n"
+            "Only continue inside a disposable, network-isolated VM with no "
+            "personal data. Revert the VM snapshot afterwards.\n\n"
+            "Type DETONATE to continue."
+        )
+        if self.confirmation_callback is not None:
+            confirmed = bool(self.confirmation_callback(warning))
+        else:
+            print("\n  !!  " + warning.replace("\n\n", "\n  !!  ") + "\n")
+            confirmed = (
+                input("  Type DETONATE to run it now (anything else cancels): ").strip()
+                == "DETONATE"
+            )
+
+        if not confirmed:
+            print("Cancelled — continuing with static analysis only.")
+            return None
+
+        sandbox = behavior_monitor.SandboxEnvironment()
+        try:
+            staged = os.path.join(sandbox.temp_dir, os.path.basename(sample_path))
+            shutil.copy2(sample_path, staged)
+            os.chmod(staged, 0o755)
+            result = sandbox.execute_and_monitor(
+                staged, timeout=DETONATION_SECONDS, auto_execute=True
+            )
+        finally:
+            sandbox.clean_up()
+
+        if "Error" in result:
+            print(f"[✖] Runtime analysis failed: {result['Error']}")
+            return None
+
+        s = result["Summary"]
+        print(
+            f"✅  Observed {s['num_new_processes']} new process(es), "
+            f"{s['num_new_connections']} connection(s), "
+            f"{s['num_dropped_files']} dropped file(s)."
+        )
+        print(
+            "⚠️  Revert your VM snapshot now — the sample and anything it "
+            "started may still be running or persisted."
+        )
+        return result
+
+    # --------------------------------------------------- VirusTotal / risk
+    def virustotal_analysis(self, file_hash, file_path, upload_vt=False):
+        try:
+            vt = virustotal_check.check_virustotal(file_hash)
+            if "Error" in vt and "not found" in vt["Error"].lower():
+                if upload_vt:
+                    print("⚡  Hash unknown — uploading to VirusTotal…")
+                    resp = virustotal_check.upload_file_for_scan(file_path)
+                    vt = (
+                        {"Error": resp["Error"]}
+                        if "Error" in resp
+                        else {
+                            "Error": "Submitted for scanning. Re-run later for results."
+                        }
+                    )
+                else:
+                    vt = {
+                        "Error": "Hash not found. File was NOT uploaded "
+                        "(use --upload-vt to share it with VirusTotal)."
+                    }
+            print(
+                "✅  VirusTotal complete."
+                if "Error" not in vt
+                else f"ℹ️  VirusTotal: {vt['Error']}"
+            )
+            return vt
+        except Exception as e:
+            logging.error(f"VirusTotal check failed: {e}")
+            print(f"[✖] VirusTotal error: {e}")
+            return {"Error": str(e)}
+
+    def risk_assessment(self, ml_result, vt_results):
+        print("🔄  Step 6 · Risk assessment…")
+        vt_ok = isinstance(vt_results, dict) and "Error" not in vt_results
+        vt_pos = vt_results.get("Malicious Detections", 0) if vt_ok else 0
+        vt_family = vt_results.get("Malware Family", "Unknown") if vt_ok else "Unknown"
+
+        if not ml_result.get("ml_available"):
+            if vt_pos >= 1:
+                return (
+                    "Malicious",
+                    f"ML unavailable; VirusTotal flagged by {vt_pos} engines "
+                    f"(label: {vt_family}).",
+                )
+            return (
+                "Unknown",
+                "ML model unavailable and no VirusTotal result.",
+            )
+
+        p_mal = ml_result.get("malicious_confidence", 0.0)
+        basis = "static + runtime" if ml_result.get("mode") == "fused" else "static-only"
+
+        if ml_result["verdict"] == "Malicious":
+            family = ml_result.get("predicted_family")
+            msg = f"Malicious per model ({p_mal:.1%}, {basis})."
+            if family:
+                msg += (
+                    f" Estimated family: {family} "
+                    f"({ml_result.get('family_confidence', 0):.1%})."
+                )
+            if vt_pos > 0:
+                msg += f" VirusTotal agrees ({vt_pos} engines, {vt_family})."
+            elif vt_ok:
+                msg += " VirusTotal did not flag it — treat disagreement carefully."
+            return "Malicious", msg
+
+        # Model says benign
+        if vt_pos >= VT_ESCALATION_THRESHOLD:
+            return (
+                "Potentially Harmful",
+                f"Model says benign ({1 - p_mal:.1%}, {basis}) but "
+                f"{vt_pos} VirusTotal engines flag it ({vt_family}). "
+                "Treat as suspicious until reviewed.",
+            )
+        msg = f"Benign per model ({1 - p_mal:.1%}, {basis})."
+        if ml_result.get("reliability") == "low":
+            msg += (
+                " Low reliability: not a Windows PE — do not treat as clean."
+            )
+        return "Benign", msg
+
+    # ------------------------------------------------------------ report
+    def generate_final_report(
+        self, label, file_info, behavior_data, ml_result, vt_data, verdict, message
+    ):
+        print("🔄  Step 7 · Generating PDF report…")
+        try:
+            os.makedirs("reports", exist_ok=True)
+            report_path = os.path.join("reports", f"{_safe_name(label)}.pdf")
+            report_generator.generate_report(
+                file_info,
+                behavior_data,
+                vt_data,
+                ml_result,
+                verdict,
+                report_path,
+                highlights={"Verdict": message},
+            )
+            self.results.append(
+                {
+                    "label": label,
+                    "verdict": verdict,
+                    "message": message,
+                    "p_mal": ml_result.get("malicious_confidence", 0.0),
+                    "ml_available": bool(ml_result.get("ml_available")),
+                    "family": ml_result.get("predicted_family"),
+                    "mode": ml_result.get("mode"),
+                    "sha256": file_info.get("SHA-256"),
+                    "size": file_info.get("Size (bytes)"),
+                    "vt_hits": (vt_data or {}).get("Malicious Detections")
+                    if isinstance(vt_data, dict) and "Error" not in vt_data
+                    else None,
+                    "report": os.path.abspath(report_path),
+                    "warnings": list(ml_result.get("warnings", [])),
+                }
+            )
+            print(f"\n{VERDICT_ICONS.get(verdict, '')}  Verdict: {verdict}")
+            print(f"   {message}")
+            for w in ml_result.get("warnings", []):
+                print(f"   ⚠️  {w}")
+            print(f"📄  Report saved: {report_path}")
+        except Exception as e:
+            logging.exception("Report generation failed")
+            print(f"[✖] Report error: {e}")
+
+    # ---------------------------------------------------------- commands
+    def do_analyze(self, arg):
+        """analyze <file_path> [--detonate] [--upload-vt]"""
+        try:
+            tokens = [t.strip('"').strip("'") for t in shlex.split(arg, posix=False)]
+        except ValueError as e:
+            print(f"Could not parse arguments: {e}")
+            return
+        flags = [t for t in tokens if t.startswith("--")]
+        path = " ".join(t for t in tokens if not t.startswith("--")).strip()
+
+        bad = [f for f in flags if f not in VALID_FLAGS]
+        if bad:
+            print(f"Unknown option(s): {' '.join(bad)}")
+            return
+        if not path:
+            print("Usage: analyze <file_path> [--detonate] [--upload-vt]")
+            return
+
+        print("🔎  Starting MalXray analysis pipeline…")
+        self.run_pipeline(
+            path,
+            detonate="--detonate" in flags,
+            upload_vt="--upload-vt" in flags,
+        )
+
+    def do_history(self, arg):
+        if not os.path.isdir("reports"):
+            print("⚠️  No reports yet.")
+            return
+        reports = sorted(
+            (f for f in os.listdir("reports") if f.endswith(".pdf")),
+            key=lambda f: os.path.getmtime(os.path.join("reports", f)),
+            reverse=True,
+        )
+        print("\n📂  Previous reports:\n" + "\n".join(reports) if reports else "None.")
+
+    def do_status(self, arg):
+        print("\n".join(self._status_lines()))
+
+    def do_clear(self, arg):
+        os.system("cls" if os.name == "nt" else "clear")
+
+    def do_exit(self, arg):
+        print("👋  Exiting MalXray. Stay secure.")
+        return True
+
+    def emptyline(self):
+        return None  # do not repeat last command
+
+    def default(self, line):
+        print(
+            f"*** Unknown command: {line.split()[0] if line.split() else line}. "
+            "Try: analyze, history, status, clear, exit"
+        )
+
+
+
+
+# ---------------------------------------------------------------------------
+# Desktop GUI  (custom-drawn widgets, no ttk dependency)
+# ---------------------------------------------------------------------------
+def _font(size, bold=False):
+    fam = (
+        "Segoe UI"
+        if sys.platform == "win32"
+        else "Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans"
+    )
+    return (fam, size, "bold") if bold else (fam, size)
+
+
+def _round_rect(c, x1, y1, x2, y2, r, **kw):
+    pts = [
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    ]
+    return c.create_polygon(pts, smooth=True, **kw)
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _open_path(path):
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        messagebox.showerror("Open", str(e))
+
+
+class FlatButton(tk.Label):
+    """Flat, hover-aware button (looks identical on Windows/macOS/Linux)."""
+
+    STYLES = {
+        "primary": (COLORS["accent2"], "#9279ff", "white"),
+        "ghost": (COLORS["surface2"], COLORS["border"], COLORS["text"]),
+    }
+
+    def __init__(self, parent, text, command, kind="primary", **kw):
+        self.kind = kind
+        self.command = command
+        self.enabled = True
+        bg, _, fg = self.STYLES[kind]
+        super().__init__(
+            parent, text=text, bg=bg, fg=fg, cursor="hand2",
+            font=_font(11 if kind == "primary" else 10, kind == "primary"),
+            padx=18, pady=10 if kind == "primary" else 7, **kw,
+        )
+        self.bind("<Enter>", lambda e: self._paint(True))
+        self.bind("<Leave>", lambda e: self._paint(False))
+        self.bind("<Button-1>", self._click)
+
+    def _paint(self, hover):
+        bg, hov, fg = self.STYLES[self.kind]
+        if not self.enabled:
+            self.configure(bg=COLORS["border"], fg=COLORS["muted"], cursor="arrow")
+        else:
+            self.configure(bg=hov if hover else bg, fg=fg, cursor="hand2")
+
+    def _click(self, _):
+        if self.enabled and self.command:
+            self.command()
+
+    def set_enabled(self, on):
+        self.enabled = on
+        self._paint(False)
+
+
+class Toggle(tk.Canvas):
+    """Pill-shaped on/off switch bound to a BooleanVar."""
+
+    def __init__(self, parent, variable, bg, command=None):
+        super().__init__(parent, width=42, height=24, bg=bg,
+                         highlightthickness=0, cursor="hand2")
+        self.var = variable
+        self.command = command
+        self.bind("<Button-1>", self._flip)
+        self.var.trace_add("write", lambda *_: self._draw())
+        self._draw()
+
+    def _flip(self, _):
+        self.var.set(not self.var.get())
+        if self.command:
+            self.command()
+
+    def _draw(self):
+        self.delete("all")
+        on = self.var.get()
+        _round_rect(self, 1, 2, 41, 22, 10,
+                    fill=COLORS["accent"] if on else COLORS["border"], outline="")
+        x = 30 if on else 12
+        self.create_oval(x - 8, 4, x + 8, 20, fill="white", outline="")
+
+
+class StepTracker(tk.Canvas):
+    STEPS = [
+        ("Inspect", "hashes · type"),
+        ("Behave", "sandbox run"),
+        ("Fuse", "merge features"),
+        ("Classify", "XGBoost model"),
+        ("Cross-check", "VirusTotal"),
+        ("Verdict", "risk + report"),
+    ]
+    # backend "Step N" -> tracker index
+    MAP = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 5}
+
+    def __init__(self, parent, bg):
+        super().__init__(parent, height=96, bg=bg, highlightthickness=0)
+        self.current = -1
+        self.skipped = set()
+        self.all_done = False
+        self.failed = False
+        self.pulse = 0
+        self.bind("<Configure>", lambda e: self.draw())
+
+    def reset(self):
+        self.current, self.skipped = -1, set()
+        self.all_done = self.failed = False
+        self.draw()
+
+    def set_step(self, backend_step, skipped=False):
+        idx = self.MAP.get(backend_step)
+        if idx is None:
+            return
+        self.current = idx
+        if skipped:
+            self.skipped.add(idx)
+        else:
+            self.skipped.discard(idx)
+        self.draw()
+
+    def finish(self, ok=True):
+        self.all_done, self.failed = ok, not ok
+        self.draw()
+
+    def tick(self):
+        self.pulse = (self.pulse + 1) % 2
+        if 0 <= self.current and not self.all_done and not self.failed:
+            self.draw()
+
+    def draw(self):
+        self.delete("all")
+        w = max(self.winfo_width(), 400)
+        n = len(self.STEPS)
+        margin = 64
+        xs = [margin + i * (w - 2 * margin) / (n - 1) for i in range(n)]
+        y = 26
+        for i in range(n - 1):
+            done = self.all_done or i < self.current
+            self.create_line(xs[i] + 16, y, xs[i + 1] - 16, y, width=3,
+                             fill=COLORS["accent"] if done else COLORS["border"])
+        for i, (name, sub) in enumerate(self.STEPS):
+            x = xs[i]
+            done = self.all_done or i < self.current
+            active = i == self.current and not self.all_done
+            if self.failed and active:
+                fill, outline, glyph, gcol = COLORS["danger"], COLORS["danger"], "!", "white"
+            elif i in self.skipped and (done or active):
+                fill, outline, glyph, gcol = COLORS["surface2"], COLORS["border"], "–", COLORS["muted"]
+            elif done:
+                fill, outline, glyph, gcol = COLORS["success"], COLORS["success"], "✓", COLORS["bg"]
+            elif active:
+                fill = COLORS["accent2"]
+                outline = COLORS["accent"] if self.pulse else COLORS["accent2"]
+                glyph, gcol = str(i + 1), "white"
+            else:
+                fill, outline, glyph, gcol = COLORS["surface"], COLORS["border"], str(i + 1), COLORS["muted"]
+            self.create_oval(x - 15, y - 15, x + 15, y + 15, fill=fill, outline=outline, width=2)
+            self.create_text(x, y, text=glyph, fill=gcol, font=_font(11, True))
+            lit = done or active
+            self.create_text(x, 58, text=name, font=_font(10, True),
+                             fill=COLORS["text"] if lit else COLORS["muted"])
+            self.create_text(x, 76, text=sub, font=_font(8), fill=COLORS["muted"])
+
+
+class Gauge(tk.Canvas):
+    """Half-circle malware-likelihood meter."""
+
+    def __init__(self, parent, bg):
+        super().__init__(parent, width=240, height=150, bg=bg, highlightthickness=0)
+        self.value = 0.0
+        self._job = None
+        self.draw(0.0, None)
+
+    @staticmethod
+    def colour(v):
+        return COLORS["success"] if v < 0.35 else COLORS["warning"] if v < 0.65 else COLORS["danger"]
+
+    def draw(self, v, label):
+        self.delete("all")
+        box = (30, 20, 210, 200)
+        self.create_arc(*box, start=180, extent=-180, style="arc", width=16,
+                        outline=COLORS["border"])
+        if v > 0.003:
+            self.create_arc(*box, start=180, extent=-180 * v, style="arc", width=16,
+                            outline=self.colour(v))
+        self.create_text(120, 90, text=label if label is not None else "–",
+                         fill=COLORS["text"], font=_font(26, True))
+        self.create_text(120, 122, text="malware likelihood", fill=COLORS["muted"],
+                         font=_font(9))
+        self.create_text(30, 110, text="0", fill=COLORS["muted"], font=_font(8))
+        self.create_text(210, 110, text="100", fill=COLORS["muted"], font=_font(8))
+
+    def animate_to(self, target, available=True):
+        if self._job:
+            self.after_cancel(self._job)
+        if not available:
+            self.draw(0.0, "N/A")
+            return
+        frames = 28
+
+        def step(i=0):
+            v = target * (i / frames) ** 0.6
+            self.draw(v, f"{v * 100:.0f}%")
+            if i < frames:
+                self._job = self.after(18, step, i + 1)
+
+        step()
+
+
+class MalXrayDesktopApp(_TkBase):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME} — Malware X-ray")
+        self.geometry("1020x800")
+        self.minsize(900, 740)
+        self.configure(bg=COLORS["bg"])
+
+        self.backend = MalXrayCLI()
+        self.backend.confirmation_callback = self._confirm_detonation
+
+        self.output_queue = queue.Queue()
+        self._buf = ""
+        self.analysis_running = False
+        self.last_report_path = None
+        self.selected = None
+        self.log_visible = False
+
+        self.detonate_var = tk.BooleanVar(value=False)
+        self.upload_vt_var = tk.BooleanVar(value=False)
+
+        self._build_ui()
+        self._refresh_status()
+        self._show_placeholder()
+        self.after(80, self._drain_output)
+        self.after(450, self._pulse)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------ UI
+    def _card(self, parent, **pack):
+        f = tk.Frame(parent, bg=COLORS["surface"], highlightthickness=1,
+                     highlightbackground=COLORS["border"])
+        f.pack(fill="x", **pack)
+        return f
+
+    def _build_ui(self):
+        root = tk.Frame(self, bg=COLORS["bg"])
+        root.pack(fill="both", expand=True, padx=26, pady=20)
+
+        # ---- header --------------------------------------------------
+        head = tk.Frame(root, bg=COLORS["bg"])
+        head.pack(fill="x", pady=(0, 16))
+        logo = tk.Canvas(head, width=44, height=44, bg=COLORS["bg"], highlightthickness=0)
+        _round_rect(logo, 2, 2, 42, 42, 12, fill=COLORS["accent2"], outline="")
+        logo.create_oval(11, 11, 33, 33, outline="white", width=2)
+        logo.create_line(22, 5, 22, 15, fill="white", width=2)
+        logo.create_line(22, 29, 22, 39, fill="white", width=2)
+        logo.create_line(5, 22, 15, 22, fill="white", width=2)
+        logo.create_line(29, 22, 39, 22, fill="white", width=2)
+        logo.create_oval(19, 19, 25, 25, fill=COLORS["accent"], outline="")
+        logo.pack(side="left")
+        titles = tk.Frame(head, bg=COLORS["bg"])
+        titles.pack(side="left", padx=12)
+        tk.Label(titles, text="MalXray", font=_font(22, True), fg=COLORS["text"],
+                 bg=COLORS["bg"]).pack(anchor="w")
+        tk.Label(titles, text="See inside any file before it sees inside your system.",
+                 font=_font(10), fg=COLORS["muted"], bg=COLORS["bg"]).pack(anchor="w")
+
+        right = tk.Frame(head, bg=COLORS["bg"])
+        right.pack(side="right")
+        FlatButton(right, "⚙  Settings", self._open_settings, kind="ghost").pack(side="right")
+        FlatButton(right, "📂  History", self._show_history, kind="ghost").pack(
+            side="right", padx=(0, 8))
+        self.chips = {}
+        for key in ("Models", "VirusTotal", "Sandbox"):
+            lbl = tk.Label(right, text=f"● {key}", font=_font(9), bg=COLORS["bg"],
+                           fg=COLORS["muted"])
+            lbl.pack(side="right", padx=(0, 14))
+            self.chips[key] = lbl
+
+        # ---- 1. choose file -----------------------------------------
+        card = self._card(root, pady=(0, 12))
+        tk.Label(card, text="1  Choose a file", font=_font(11, True), fg=COLORS["text"],
+                 bg=COLORS["surface"]).pack(anchor="w", padx=16, pady=(12, 6))
+        self.drop = tk.Canvas(card, height=104, bg=COLORS["surface"], highlightthickness=0,
+                              cursor="hand2")
+        self.drop.pack(fill="x", padx=16)
+        self.drop.bind("<Configure>", lambda e: self._draw_drop())
+        self.drop.bind("<Button-1>", lambda e: self._browse_file())
+        self.drop.bind("<Enter>", lambda e: self._draw_drop(True))
+        self.drop.bind("<Leave>", lambda e: self._draw_drop(False))
+        if HAS_DND:
+            self.drop.drop_target_register(DND_FILES)
+            self.drop.dnd_bind("<<Drop>>", self._on_drop)
+
+        opts = tk.Frame(card, bg=COLORS["surface"])
+        opts.pack(fill="x", padx=16, pady=12)
+        for var, title, sub in (
+            (self.upload_vt_var, "Share unknown files with VirusTotal",
+             "Off = only the file's fingerprint is looked up"),
+            (self.detonate_var, "Run it in a sandbox (VM only)",
+             "Off = file is never executed (safe default)"),
+        ):
+            row = tk.Frame(opts, bg=COLORS["surface"])
+            row.pack(side="left", padx=(0, 26))
+            Toggle(row, var, COLORS["surface"]).pack(side="left")
+            txt = tk.Frame(row, bg=COLORS["surface"])
+            txt.pack(side="left", padx=8)
+            tk.Label(txt, text=title, font=_font(10), fg=COLORS["text"],
+                     bg=COLORS["surface"]).pack(anchor="w")
+            tk.Label(txt, text=sub, font=_font(8), fg=COLORS["muted"],
+                     bg=COLORS["surface"]).pack(anchor="w")
+        self.scan_btn = FlatButton(opts, "🔎   Scan file", self._start_analysis)
+        self.scan_btn.pack(side="right")
+
+        # ---- 2. progress --------------------------------------------
+        card2 = self._card(root, pady=(0, 12))
+        tk.Label(card2, text="2  Watch it work", font=_font(11, True), fg=COLORS["text"],
+                 bg=COLORS["surface"]).pack(anchor="w", padx=16, pady=(12, 0))
+        self.tracker = StepTracker(card2, COLORS["surface"])
+        self.tracker.pack(fill="x", padx=16, pady=(4, 0))
+        self.status_var = tk.StringVar(value="Waiting for a file…")
+        tk.Label(card2, textvariable=self.status_var, font=_font(9), fg=COLORS["muted"],
+                 bg=COLORS["surface"]).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # ---- 3. result ----------------------------------------------
+        card3 = self._card(root, pady=(0, 8))
+        tk.Label(card3, text="3  Result", font=_font(11, True), fg=COLORS["text"],
+                 bg=COLORS["surface"]).pack(anchor="w", padx=16, pady=(12, 0))
+        self.result = tk.Frame(card3, bg=COLORS["surface"])
+        self.result.pack(fill="x", padx=16, pady=(6, 14))
+
+        # ---- technical log (hidden by default) ----------------------
+        bar = tk.Frame(root, bg=COLORS["bg"])
+        bar.pack(fill="x")
+        self.log_btn = FlatButton(bar, "Show technical log ▾", self._toggle_log, kind="ghost")
+        self.log_btn.pack(side="left")
+        tk.Label(bar, text=f"v{APP_VERSION}  ·  data folder: {APP_HOME}", font=_font(8),
+                 fg=COLORS["muted"], bg=COLORS["bg"]).pack(side="right")
+        self.log_frame = tk.Frame(root, bg=COLORS["surface2"])
+        self.output = tk.Text(
+            self.log_frame, wrap="word", height=9, bg=COLORS["surface2"], fg=COLORS["text"],
+            font=("Consolas" if sys.platform == "win32" else "Menlo" if sys.platform == "darwin" else "DejaVu Sans Mono", 9),
+            relief="flat", padx=12, pady=8, highlightthickness=0, insertbackground=COLORS["text"],
+        )
+        self.output.pack(fill="both", expand=True)
+        for tag, col in (("ok", "success"), ("warn", "warning"), ("err", "danger"),
+                         ("info", "accent")):
+            self.output.tag_configure(tag, foreground=COLORS[col])
+
+    # ---------------------------------------------------------- drop zone
+    def _draw_drop(self, hover=False):
+        c = self.drop
+        c.delete("all")
+        w = max(c.winfo_width(), 300)
+        h = 104
+        edge = COLORS["accent"] if hover else COLORS["border"]
+        _round_rect(c, 2, 2, w - 2, h - 2, 14, fill=COLORS["surface2"] if hover else COLORS["bg"],
+                    outline=edge, width=2, dash=(7, 5))
+        if self.selected:
+            size = os.path.getsize(self.selected) if os.path.isfile(self.selected) else 0
+            c.create_text(w / 2, 36, text="📄  " + os.path.basename(self.selected),
+                          fill=COLORS["text"], font=_font(13, True))
+            c.create_text(w / 2, 62, text=f"{_human_size(size)}  ·  {os.path.dirname(self.selected)}",
+                          fill=COLORS["muted"], font=_font(9))
+            c.create_text(w / 2, 84, text="click to choose a different file",
+                          fill=COLORS["accent"], font=_font(9))
+        else:
+            c.create_text(w / 2, 38, text="⬇", fill=COLORS["accent"], font=_font(22))
+            msg = "Drag a file here, or click to browse" if HAS_DND else "Click to browse for a file"
+            c.create_text(w / 2, 72, text=msg, fill=COLORS["text"], font=_font(11))
+
+    def _on_drop(self, event):
+        try:
+            items = self.tk.splitlist(event.data)
+            if items:
+                self._set_file(items[0])
+        except Exception:
+            pass
+
+    def _browse_file(self):
+        path = filedialog.askopenfilename(
+            title="Select a file to scan",
+            filetypes=[("All files", "*.*"), ("Programs", "*.exe *.dll *.sys"),
+                       ("Archives", "*.zip *.rar *.7z")],
+        )
+        if path:
+            self._set_file(path)
+
+    def _set_file(self, path):
+        if os.path.isfile(path):
+            self.selected = os.path.abspath(path)
+            self.status_var.set("Ready — press “Scan file”.")
+            self.tracker.reset()
+            self._show_placeholder()
+            self._draw_drop()
+
+    # ------------------------------------------------------------- status
+    def _refresh_status(self):
+        lines = self.backend._status_lines()
+        vals = [ln.split(":", 1)[1].strip() for ln in lines]
+        ok = [vals[0].startswith("ready"), "key set" in vals[1], vals[2] == "enabled"]
+        text = ["Models", "VirusTotal", "Sandbox"]
+        for lbl, good, key, v in zip(self.chips.values(), ok, text, vals):
+            lbl.configure(fg=COLORS["success"] if good else COLORS["warning"]
+                          if key != "Sandbox" else COLORS["muted"])
+        self.chips["Models"].configure(
+            text="● Models ready" if ok[0] else "● Models missing")
+        self.chips["VirusTotal"].configure(
+            text="● VirusTotal on" if ok[1] else "● VirusTotal off")
+        self.chips["Sandbox"].configure(
+            text="● Sandbox on" if ok[2] else "● Sandbox off")
+
+    # ------------------------------------------------------------- results
+    def _clear_result(self):
+        for w in self.result.winfo_children():
+            w.destroy()
+
+    def _show_placeholder(self, text="Your verdict will appear here after a scan."):
+        self._clear_result()
+        tk.Label(self.result, text=text, font=_font(10), fg=COLORS["muted"],
+                 bg=COLORS["surface"]).pack(anchor="w", pady=14)
+
+    def _show_result(self, results):
+        self._clear_result()
+        rank = {"Malicious": 3, "Potentially Harmful": 2, "Unknown": 1, "Benign": 0}
+        r = max(results, key=lambda x: rank.get(x["verdict"], 0))
+        colour = {"Malicious": COLORS["danger"], "Potentially Harmful": COLORS["warning"],
+                  "Benign": COLORS["success"], "Unknown": COLORS["muted"]}[r["verdict"]]
+        plain = {
+            "Malicious": "Strong signs of malware. Do not open or run this file.",
+            "Potentially Harmful": "Our model says safe, but several antivirus engines disagree. Treat it as suspicious.",
+            "Benign": "No strong signs of malware were found.",
+            "Unknown": "MalXray could not reach a decision (models missing and no VirusTotal answer).",
+        }[r["verdict"]]
+        self.last_report_path = r["report"]
+
+        left = tk.Frame(self.result, bg=COLORS["surface"])
+        left.pack(side="left", padx=(0, 20))
+        g = Gauge(left, COLORS["surface"])
+        g.pack()
+        g.animate_to(r["p_mal"], r["ml_available"])
+
+        mid = tk.Frame(self.result, bg=COLORS["surface"])
+        mid.pack(side="left", fill="both", expand=True)
+        tk.Label(mid, text=f"{VERDICT_ICONS.get(r['verdict'], '')}  {r['verdict'].upper()}",
+                 font=_font(22, True), fg=colour, bg=COLORS["surface"]).pack(anchor="w")
+        tk.Label(mid, text=plain, font=_font(11), fg=COLORS["text"], bg=COLORS["surface"],
+                 wraplength=560, justify="left").pack(anchor="w", pady=(2, 8))
+        tk.Label(mid, text=r["message"], font=_font(9), fg=COLORS["muted"],
+                 bg=COLORS["surface"], wraplength=560, justify="left").pack(anchor="w")
+        for w in r["warnings"]:
+            tk.Label(mid, text="⚠  " + w, font=_font(9), fg=COLORS["warning"],
+                     bg=COLORS["surface"], wraplength=560, justify="left").pack(anchor="w")
+
+        facts = tk.Frame(mid, bg=COLORS["surface"])
+        facts.pack(anchor="w", pady=(10, 8))
+        vt = "not checked" if r["vt_hits"] is None else f"{r['vt_hits']} engine(s) flagged it"
+        sha = r["sha256"] or "-"
+        for k, v in (
+            ("Likely family", r["family"] or "—"),
+            ("VirusTotal", vt),
+            ("Method", {"fused": "static + runtime", "static_only": "static only"}.get(
+                r["mode"], r["mode"] or "—")),
+            ("SHA-256", sha[:16] + "…" if len(sha) > 16 else sha),
+        ):
+            cell = tk.Frame(facts, bg=COLORS["surface2"])
+            cell.pack(side="left", padx=(0, 8), ipadx=8, ipady=4)
+            tk.Label(cell, text=k, font=_font(8), fg=COLORS["muted"],
+                     bg=COLORS["surface2"]).pack(anchor="w", padx=6)
+            lab = tk.Label(cell, text=v, font=_font(10, True), fg=COLORS["text"],
+                           bg=COLORS["surface2"])
+            lab.pack(anchor="w", padx=6)
+            if k == "SHA-256" and r["sha256"]:
+                lab.configure(cursor="hand2")
+                lab.bind("<Button-1>", lambda e, s=r["sha256"]: self._copy(s))
+
+        btns = tk.Frame(mid, bg=COLORS["surface"])
+        btns.pack(anchor="w")
+        FlatButton(btns, "📄  Open PDF report", lambda: _open_path(r["report"])).pack(
+            side="left", padx=(0, 8))
+        FlatButton(btns, "Scan another file", self._reset, kind="ghost").pack(side="left")
+        if len(results) > 1:
+            tk.Label(mid, text=f"Archive: {len(results)} files scanned — showing the riskiest.",
+                     font=_font(9), fg=COLORS["muted"], bg=COLORS["surface"]).pack(
+                anchor="w", pady=(8, 0))
+
+    def _copy(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set("SHA-256 copied to clipboard.")
+
+    def _reset(self):
+        self.selected = None
+        self.tracker.reset()
+        self.status_var.set("Waiting for a file…")
+        self._show_placeholder()
+        self._draw_drop()
+
+    # ------------------------------------------------------- log + stream
+    def _toggle_log(self):
+        self.log_visible = not self.log_visible
+        if self.log_visible:
+            self.log_frame.pack(fill="both", expand=True, pady=(8, 0))
+            self.log_btn.configure(text="Hide technical log ▴")
+            self.geometry(f"{self.winfo_width()}x{self.winfo_height() + 190}")
+        else:
+            self.log_frame.pack_forget()
+            self.log_btn.configure(text="Show technical log ▾")
+            self.geometry(f"{self.winfo_width()}x{max(self.winfo_height() - 190, 740)}")
+
+    def _append(self, text, tag=None):
+        self.output.insert("end", text, tag)
+        self.output.see("end")
+
+    def _drain_output(self):
+        try:
+            while True:
+                self._buf += self.output_queue.get_nowait()
+        except queue.Empty:
+            pass
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._handle_line(line)
+        self.after(80, self._drain_output)
+
+    STEP_TEXT = {
+        1: "Reading the file and computing its fingerprints…",
+        2: "Running it in the sandbox…",
+        3: "Merging static and runtime features…",
+        4: "Asking the XGBoost model…",
+        5: "Cross-checking with VirusTotal…",
+        6: "Weighing the evidence…",
+        7: "Writing the PDF report…",
+    }
+
+    def _handle_line(self, line):
+        tag = None
+        low = line.lower()
+        if line.startswith("✅") or "complete" in low:
+            tag = "ok"
+        elif line.startswith("⚠️") or line.startswith("[!]"):
+            tag = "warn"
+        elif line.startswith("[✖]") or "failed" in low:
+            tag = "err"
+        elif line.startswith("🔄") or line.startswith("🔎"):
+            tag = "info"
+        self._append(line + "\n", tag)
+        m = re.search(r"Step (\d)", line)
+        if m:
+            n = int(m.group(1))
+            self.tracker.set_step(n, skipped=(n == 2 and "skipped" in low))
+            if not (n == 2 and "skipped" in low):
+                self.status_var.set(f"Step {StepTracker.MAP[n] + 1} of 6 · {self.STEP_TEXT[n]}")
+
+    def _pulse(self):
+        self.tracker.tick()
+        self.after(450, self._pulse)
+
+    # ------------------------------------------------------------ settings
+    def _open_settings(self):
+        win = tk.Toplevel(self)
+        win.title("MalXray — Settings")
+        win.configure(bg=COLORS["bg"])
+        win.geometry("560x420")
+        win.transient(self)
+        pad = {"padx": 22}
+        tk.Label(win, text="Settings", font=_font(16, True), fg=COLORS["text"],
+                 bg=COLORS["bg"]).pack(anchor="w", pady=(18, 10), **pad)
+
+        tk.Label(win, text="VirusTotal API key (optional)", font=_font(10, True),
+                 fg=COLORS["text"], bg=COLORS["bg"]).pack(anchor="w", **pad)
+        tk.Label(win, text="Adds a second opinion from 70+ antivirus engines. Free key at virustotal.com.",
+                 font=_font(9), fg=COLORS["muted"], bg=COLORS["bg"]).pack(anchor="w", **pad)
+        key_var = tk.StringVar(value=os.environ.get("VIRUSTOTAL_API_KEY", ""))
+        ent = tk.Entry(win, textvariable=key_var, show="•", font=_font(11), bg=COLORS["surface2"],
+                       fg=COLORS["text"], insertbackground=COLORS["text"], relief="flat")
+        ent.pack(fill="x", ipady=7, pady=(6, 4), **pad)
+        note = tk.Label(win, text="", font=_font(9), fg=COLORS["success"], bg=COLORS["bg"])
+        note.pack(anchor="w", **pad)
+
+        def save():
+            key = key_var.get().strip()
+            cfg = load_config()
+            if key:
+                cfg["vt_api_key"] = key
+                os.environ["VIRUSTOTAL_API_KEY"] = key
+            else:
+                cfg.pop("vt_api_key", None)
+                os.environ.pop("VIRUSTOTAL_API_KEY", None)
+            save_config(cfg)
+            virustotal_check.API_KEY = key or None
+            self._refresh_status()
+            note.configure(text="Saved." if key else "Key removed.")
+
+        FlatButton(win, "Save key", save).pack(anchor="w", pady=6, **pad)
+
+        tk.Label(win, text="Where things live", font=_font(10, True), fg=COLORS["text"],
+                 bg=COLORS["bg"]).pack(anchor="w", pady=(14, 2), **pad)
+        tk.Label(win, text=f"Reports & logs: {APP_HOME}\nModels: {os.environ.get('MALXRAY_MODEL_DIR')}",
+                 font=_font(9), fg=COLORS["muted"], bg=COLORS["bg"], justify="left").pack(
+            anchor="w", **pad)
+        FlatButton(win, "Open data folder", lambda: _open_path(APP_HOME), kind="ghost").pack(
+            anchor="w", pady=10, **pad)
+
+    # -------------------------------------------------------------- history
+    def _show_history(self):
+        reports_dir = os.path.abspath("reports")
+        reports = []
+        if os.path.isdir(reports_dir):
+            reports = sorted(
+                (f for f in os.listdir(reports_dir) if f.lower().endswith(".pdf")),
+                key=lambda f: os.path.getmtime(os.path.join(reports_dir, f)),
+                reverse=True,
+            )
+        if not reports:
+            messagebox.showinfo("History", "No reports generated yet.")
+            return
+        win = tk.Toplevel(self)
+        win.title("MalXray — Report history")
+        win.geometry("640x420")
+        win.configure(bg=COLORS["bg"])
+        tk.Label(win, text="Previous reports (newest first)", font=_font(13, True),
+                 fg=COLORS["text"], bg=COLORS["bg"]).pack(anchor="w", padx=18, pady=14)
+        lb = tk.Listbox(win, font=_font(10), bg=COLORS["surface2"], fg=COLORS["text"],
+                        selectbackground=COLORS["accent2"], relief="flat",
+                        highlightthickness=0, activestyle="none")
+        lb.pack(fill="both", expand=True, padx=18)
+        for name in reports:
+            lb.insert("end", name)
+
+        def open_selected(_=None):
+            sel = lb.curselection()
+            if sel:
+                _open_path(os.path.join(reports_dir, lb.get(sel[0])))
+
+        lb.bind("<Double-Button-1>", open_selected)
+        FlatButton(win, "Open selected report", open_selected).pack(pady=14)
+
+    # ------------------------------------------------------------- scanning
+    def _confirm_detonation(self, warning):
+        result = {"confirmed": False}
+        event = threading.Event()
+
+        def ask():
+            result["confirmed"] = messagebox.askyesno(
+                "MalXray — Confirm sandbox run",
+                warning + "\n\nClick Yes only if this machine is the disposable, "
+                "network-isolated VM described above.",
+                icon="warning",
+            )
+            event.set()
+
+        self.after(0, ask)
+        event.wait()
+        return result["confirmed"]
+
+    def _start_analysis(self):
+        if self.analysis_running:
+            return
+        path = self.selected
+        if not path:
+            messagebox.showwarning("MalXray", "Choose a file first (drop it on the box or click it).")
+            return
+        if not os.path.isfile(path):
+            messagebox.showerror("MalXray", "That file no longer exists.")
+            return
+
+        if self.detonate_var.get() and os.environ.get("MALXRAY_ISOLATED_VM") != "1":
+            messagebox.showwarning(
+                "Sandbox run blocked",
+                "The sandbox option is on, but MALXRAY_ISOLATED_VM=1 is not set.\n\n"
+                "The file will NOT be executed. To enable it, run MalXray inside a "
+                "disposable, network-isolated VM and set that environment variable there.",
+            )
+            self.detonate_var.set(False)
+
+        self.analysis_running = True
+        self.scan_btn.set_enabled(False)
+        self.tracker.reset()
+        self.tracker.set_step(1)
+        self.status_var.set(f"Step 1 of 6 · {self.STEP_TEXT[1]}")
+        self._show_placeholder("Scanning…")
+        self._append("\n" + "─" * 60 + "\n🔎  Starting analysis…\n", "info")
+
+        detonate, upload = self.detonate_var.get(), self.upload_vt_var.get()
+
+        def worker():
+            writer = _QueueWriter(self.output_queue)
+            old_out, old_err = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = writer
+            try:
+                self.backend.run_pipeline(path, detonate=detonate, upload_vt=upload)
+            except Exception as exc:
+                logging.exception("Desktop analysis failed")
+                print(f"[✖] Desktop analysis failed: {exc}")
+            finally:
+                sys.stdout, sys.stderr = old_out, old_err
+                self.after(0, self._analysis_finished)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _analysis_finished(self):
+        self.analysis_running = False
+        self.scan_btn.set_enabled(True)
+        self._drain_output_now()
+        results = self.backend.results
+        if results:
+            self.tracker.finish(True)
+            self.status_var.set("Scan complete.")
+            self._show_result(results)
+        else:
+            self.tracker.finish(False)
+            self.status_var.set("Scan could not finish — open the technical log for details.")
+            self._show_placeholder("The scan did not produce a result. See the technical log.")
+        self._refresh_status()
+
+    def _drain_output_now(self):
+        try:
+            while True:
+                self._buf += self.output_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if self._buf:
+            self._buf += "\n"
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._handle_line(line)
+
+    def _on_close(self):
+        if self.analysis_running and not messagebox.askyesno(
+            "Exit MalXray", "A scan is still running. Exit anyway?"
+        ):
+            return
+        self.destroy()
+
+
+class _QueueWriter:
+    def __init__(self, q):
+        self.q = q
+
+    def write(self, value):
+        if value:
+            self.q.put(value)
+
+    def flush(self):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Installer builder:  python MalXray.py --build
+# ---------------------------------------------------------------------------
+INNO_TEMPLATE = r"""; Auto-generated by MalXray.py --build
+[Setup]
+AppId={{8F3C2A51-6B7D-4E19-9A3E-5C1D2B7A90F4}
+AppName=@NAME@
+AppVersion=@VERSION@
+AppPublisher=MalXray MSc Project
+DefaultDirName={autopf}\@NAME@
+DefaultGroupName=@NAME@
+UninstallDisplayIcon={app}\@NAME@.exe
+OutputDir=@OUTDIR@
+OutputBaseFilename=MalXray_Setup
+@ICONLINE@Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
+
+[Files]
+Source: "@DIST@\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+
+[Icons]
+Name: "{group}\@NAME@"; Filename: "{app}\@NAME@.exe"
+Name: "{group}\Uninstall @NAME@"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\@NAME@"; Filename: "{app}\@NAME@.exe"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\@NAME@.exe"; Description: "Launch @NAME@ now"; Flags: nowait postinstall skipifsilent
+"""
+
+
+def _make_icon(path):
+    """Draw the MalXray reticle logo as a multi-size .ico (needs Pillow)."""
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+    s = 256
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((8, 8, s - 8, s - 8), radius=60, fill=COLORS["accent2"])
+    d.ellipse((64, 64, 192, 192), outline="white", width=12)
+    for box in ((122, 24, 134, 84), (122, 172, 134, 232), (24, 122, 84, 134), (172, 122, 232, 134)):
+        d.rectangle(box, fill="white")
+    d.ellipse((108, 108, 148, 148), fill=COLORS["accent"])
+    img.save(path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    return path
+
+
+def _run(cmd_list, cwd):
+    print("   $ " + " ".join(f'"{c}"' if " " in c else c for c in cmd_list))
+    subprocess.check_call(cmd_list, cwd=cwd)
+
+
+def _find_iscc():
+    found = shutil.which("iscc") or shutil.which("ISCC")
+    if found:
+        return found
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+        if base:
+            cand = os.path.join(base, "Inno Setup 6", "ISCC.exe")
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def build_installer():
+    if FROZEN:
+        print("Already an installed build — run --build from the source folder.")
+        return 1
+    root = SOURCE_DIR
+    build_dir = os.path.join(root, "build")
+    dist_dir = os.path.join(root, "dist")
+    out_dir = os.path.join(root, "installer")
+    py = sys.executable
+    print(f"\n=== {APP_NAME} {APP_VERSION} · building installable software ===\n")
+
+    print("[1/5] Installing build tools…")
+    req = os.path.join(root, "requirements.txt")
+    if os.path.isfile(req):
+        _run([py, "-m", "pip", "install", "--quiet", "-r", req], root)
+    _run([py, "-m", "pip", "install", "--quiet", "pyinstaller", "pillow"], root)
+
+    print("[2/5] Checking ML models…")
+    model_dir = os.environ["MALXRAY_MODEL_DIR"]
+    need = [ml_classifier.PATHS["binary_static"], ml_classifier.PATHS["binary_fused"]]
+    if not all(os.path.exists(p) for p in need):
+        print("   Models missing — generating training data and training (a few minutes)…")
+        _run([py, "generate_training_data.py"], root)
+        _run([py, "train_model.py"], root)
+    if not os.path.isdir(model_dir) or not os.listdir(model_dir):
+        print("[✖] Models folder is still empty — fix training first.")
+        return 1
+    print(f"   Models OK ({len(os.listdir(model_dir))} files)")
+
+    print("[3/5] Creating app icon…")
+    os.makedirs(build_dir, exist_ok=True)
+    icon = _make_icon(os.path.join(build_dir, "MalXray.ico"))
+
+    print("[4/5] Packaging the application (PyInstaller)…")
+    cmd_list = [
+        py, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
+        "--name", APP_NAME, "--distpath", dist_dir, "--workpath", build_dir,
+        "--specpath", build_dir, "--paths", root,
+        "--add-data", f"{model_dir}{os.pathsep}models",
+        "--collect-all", "xgboost", "--collect-all", "sklearn",
+        "--collect-data", "reportlab",
+        "--hidden-import", "joblib", "--hidden-import", "psutil",
+    ]
+    if HAS_DND:
+        cmd_list += ["--collect-all", "tkinterdnd2"]
+    else:
+        print("   (tkinterdnd2 not installed — drag-and-drop will be click-to-browse only)")
+    if icon:
+        cmd_list += ["--icon", icon]
+    cmd_list.append(os.path.abspath(__file__))
+    _run(cmd_list, root)
+    app_dir = os.path.join(dist_dir, APP_NAME)
+
+    print("[5/5] Creating the installer…")
+    os.makedirs(out_dir, exist_ok=True)
+    iscc = _find_iscc() if os.name == "nt" else None
+    if iscc:
+        iss = INNO_TEMPLATE
+        for k, v in {
+            "@NAME@": APP_NAME, "@VERSION@": APP_VERSION, "@OUTDIR@": out_dir,
+            "@DIST@": app_dir,
+            "@ICONLINE@": f"SetupIconFile={icon}\n" if icon else "",
+        }.items():
+            iss = iss.replace(k, v)
+        iss_path = os.path.join(build_dir, "MalXray.iss")
+        with open(iss_path, "w", encoding="utf-8") as f:
+            f.write(iss)
+        _run([iscc, iss_path], root)
+        print(f"\n✅  Done!  Installer: {os.path.join(out_dir, 'MalXray_Setup.exe')}")
+        print("    Double-click it to install MalXray, then launch it from the Start menu.")
+        return 0
+
+    zip_base = os.path.join(out_dir, "MalXray_Portable")
+    shutil.make_archive(zip_base, "zip", dist_dir, APP_NAME)
+    print(f"\n✅  App built: {app_dir}")
+    print(f"    Portable zip: {zip_base}.zip  (unzip anywhere, run {APP_NAME}.exe)")
+    if os.name == "nt":
+        print("    For a proper Setup wizard, install Inno Setup 6 (https://jrsoftware.org/isdl.php)")
+        print("    and run:  python MalXray.py --build   again.")
+    else:
+        print("    Setup.exe can only be built on Windows — run --build there.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main():
+    if "--build" in sys.argv and not FROZEN:
+        try:
+            sys.exit(build_installer())
+        except subprocess.CalledProcessError as e:
+            print(f"[✖] Build step failed: {e}")
+            sys.exit(1)
+
+    if "--cli" in sys.argv:
+        try:
+            MalXrayCLI().cmdloop()
+        except KeyboardInterrupt:
+            print("\n👋  Interrupted.")
+        except Exception as e:
+            logging.exception("CLI error")
+            print(f"[✖] Unexpected error: {e}")
+            input("Press Enter to exit…")
+        return
+
+    if sys.platform == "win32":
+        try:  # crisp text on high-DPI screens
+            import ctypes
+
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    try:
+        app = MalXrayDesktopApp()
+        app.mainloop()
+    except KeyboardInterrupt:
+        print("\n👋  Interrupted.")
+    except Exception as e:
+        logging.exception("Desktop error")
+        try:
+            messagebox.showerror("MalXray Error", str(e))
+        except Exception:
+            print(f"[✖] Unexpected error: {e}")
+
+
+if __name__ == "__main__":
+    main()
